@@ -1,0 +1,79 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"> <!-- tools namespace added -->
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Permission required to run Foreground Service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Permission for media playback foreground service type (Android 14+) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- Permission to show notifications for Android 13 (API 33) and above -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+
+    <application
+      android:name=".MainApplication"
+      android:label="@string/app_name"
+      android:icon="@mipmap/ic_launcher"
+      android:roundIcon="@mipmap/ic_launcher_round"
+      android:allowBackup="false"
+      android:theme="@style/AppTheme"
+      android:supportsRtl="true">
+
+      <activity
+        android:name=".MainActivity"
+        android:label="@string/app_name"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:launchMode="singleTask"
+        android:windowSoftInputMode="adjustResize"
+        android:screenOrientation="portrait"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+        <!-- Intent filter to handle Tile preferences/long-press action -->
+        <intent-filter>
+            <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+        </intent-filter>
+      </activity>
+
+      <!-- Widget Provider Receiver -->
+      <receiver
+          android:name=".VolumeBoosterWidgetProvider"
+          android:exported="false"
+          android:label="@string/app_name">
+          <!-- Widget will only be launched by the system -->
+          <!-- Widget label -->
+          <intent-filter>
+              <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+          </intent-filter>
+          <meta-data
+              android:name="android.appwidget.provider"
+              android:resource="@xml/volume_booster_widget_info" />
+      </receiver>
+
+      <!-- Booster Service -->
+      <service
+          android:name=".BoosterService"
+          android:enabled="true"
+          android:exported="false"
+          android:foregroundServiceType="mediaPlayback" /> <!-- Service will only be launched from within the app -->
+
+      <!-- Quick Settings Tile Service -->
+      <service
+          android:name=".BoosterTileService"
+          android:icon="@drawable/ic_volume_up_white"
+          android:label="@string/tile_label"
+          android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+          android:exported="true">
+          <intent-filter>
+              <action android:name="android.service.quicksettings.action.QS_TILE" />
+          </intent-filter>
+          <!-- Additional meta-data for Android 12 and above -->
+          <meta-data android:name="android.service.quicksettings.ACTIVE_TILE"
+              android:value="true" />
+      </service>
+
+    </application>
+</manifest>

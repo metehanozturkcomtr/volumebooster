@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Volume Booster - by MTHN</string>
+    <string name="widget_toggle_boost">Toggle Volume Booster</string>
+    <string name="tile_label">Volume Booster</string> <!-- Quick Settings Tile Label -->
+</resources>
