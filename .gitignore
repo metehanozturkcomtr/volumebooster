@@ -96,3 +96,5 @@ PLAN.md
 AGENTS.md
 
 .cursor/
+# Keystores
+*.keystore
