@@ -1,16 +1,21 @@
 package com.volumeboosterapp
 
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences // SharedPreferences added
-// import android.media.AudioManager // AudioManager removed
+import android.content.IntentFilter
+import android.content.SharedPreferences
+import android.media.audiofx.AudioEffect
 import android.media.audiofx.LoudnessEnhancer
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 
 class BoosterService : Service() {
 
@@ -21,49 +26,162 @@ class BoosterService : Service() {
     // Constants moved into companion object
 
     private lateinit var sharedPreferences: SharedPreferences
-    // private lateinit var audioManager: AudioManager // AudioManager removed
 
-    private val loudnessEnhancer: LoudnessEnhancer? by lazy {
-        try {
-            LoudnessEnhancer(0).apply { // Session ID 0 (global)
-                // Read initial level from SharedPreferences and apply
-                val initialLevel = getBoostLevelFromPrefs()
-                applyBoostLevel(this, initialLevel)
-                Log.d(TAG, "LoudnessEnhancer initialized. Initial Level: $initialLevel mB")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "LoudnessEnhancer could not be initialized in Service", e)
-            null
-        }
-    }
+    private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var audioSessionReceiver: BroadcastReceiver? = null
+    private val healthCheckHandler = Handler(Looper.getMainLooper())
+    private var healthCheckRunnable: Runnable? = null
 
     companion object {
         private const val TAG = "BoosterService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "VolumeBoosterChannel"
+        private const val HEALTH_CHECK_INTERVAL_MS = 3000L
         const val ACTION_START_SERVICE = "com.volumeboosterapp.ACTION_START_SERVICE"
         const val ACTION_STOP_SERVICE = "com.volumeboosterapp.ACTION_STOP_SERVICE"
-        const val ACTION_TOGGLE_BOOST = "com.volumeboosterapp.ACTION_TOGGLE_BOOST" // Common action
-        const val ACTION_SET_BOOST_LEVEL = "com.volumeboosterapp.ACTION_SET_BOOST_LEVEL" // New action
-        const val ACTION_EXIT_APP = "com.volumeboosterapp.ACTION_EXIT_APP" // New Exit action
-        const val ACTION_UPDATE_NOTIFICATION = "com.volumeboosterapp.ACTION_UPDATE_NOTIFICATION" // New action to force notification update
-        const val ACTION_FINISH_ACTIVITY = "com.volumeboosterapp.ACTION_FINISH_ACTIVITY" // Broadcast to close activity
-        const val ACTION_BOOST_LEVEL_UPDATED = "com.volumeboosterapp.ACTION_BOOST_LEVEL_UPDATED" // Level update broadcast
-        const val EXTRA_BOOST_LEVEL = "com.volumeboosterapp.EXTRA_BOOST_LEVEL" // Intent extra key
-        const val EXTRA_NEW_BOOST_LEVEL = "com.volumeboosterapp.EXTRA_NEW_BOOST_LEVEL" // New level extra key
+        const val ACTION_TOGGLE_BOOST = "com.volumeboosterapp.ACTION_TOGGLE_BOOST"
+        const val ACTION_SET_BOOST_LEVEL = "com.volumeboosterapp.ACTION_SET_BOOST_LEVEL"
+        const val ACTION_EXIT_APP = "com.volumeboosterapp.ACTION_EXIT_APP"
+        const val ACTION_UPDATE_NOTIFICATION = "com.volumeboosterapp.ACTION_UPDATE_NOTIFICATION"
+        const val ACTION_FINISH_ACTIVITY = "com.volumeboosterapp.ACTION_FINISH_ACTIVITY"
+        const val ACTION_BOOST_LEVEL_UPDATED = "com.volumeboosterapp.ACTION_BOOST_LEVEL_UPDATED"
+        const val EXTRA_BOOST_LEVEL = "com.volumeboosterapp.EXTRA_BOOST_LEVEL"
+        const val EXTRA_NEW_BOOST_LEVEL = "com.volumeboosterapp.EXTRA_NEW_BOOST_LEVEL"
+        const val DEFAULT_BOOST_LEVEL = 3500
+        const val MAX_BOOST_LEVEL = 7000
+    }
 
-        // Constants must be in companion object for Java access
-        const val DEFAULT_BOOST_LEVEL = 3500 // Default level when toggle is turned on (mB)
-        // WARNING: High levels can cause audio distortion or speaker damage!
-        const val MAX_BOOST_LEVEL = 7000 // Maximum level increased to 7000 mB
+    /**
+     * Creates a new LoudnessEnhancer instance (session 0), releasing any existing one first.
+     * This is called on service start, and whenever we detect the audio session has changed
+     * (e.g. track change, playback restart) to work around Android 12+ custom ROM behavior
+     * where effects attached to session 0 become stale.
+     */
+    private fun createOrRecreateLoudnessEnhancer() {
+        try {
+            // Release old instance if it exists
+            loudnessEnhancer?.let { old ->
+                try {
+                    old.enabled = false
+                    old.release()
+                    Log.d(TAG, "Old LoudnessEnhancer released before recreation.")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error releasing old LoudnessEnhancer", e)
+                }
+            }
+            loudnessEnhancer = null
 
-        // Public method to read status from SharedPreferences (AudioModule can use)
-        // Note: Access via Context might be more appropriate than this static method.
-        // For now, let's assume AudioModule reads its own SharedPreferences.
-        // fun getBoostStatus(context: Context): Boolean {
-        //     val prefs = context.getSharedPreferences("BoosterPrefs", Context.MODE_PRIVATE)
-        //     return prefs.getBoolean("boost_enabled", false)
-        // }
+            val level = getBoostLevelFromPrefs()
+            val newEnhancer = LoudnessEnhancer(0) // Session ID 0 (global output mix)
+            applyBoostLevel(newEnhancer, level)
+            loudnessEnhancer = newEnhancer
+            Log.d(TAG, "LoudnessEnhancer (re)created. Level: $level mB")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create LoudnessEnhancer", e)
+            loudnessEnhancer = null
+        }
+    }
+
+    /**
+     * Registers a BroadcastReceiver that listens for new audio sessions being opened.
+     * When a media app opens a new audio session (track change, new playback, etc.),
+     * we recreate the LoudnessEnhancer to ensure the boost effect is re-applied.
+     */
+    private fun registerAudioSessionReceiver() {
+        audioSessionReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                val action = intent?.action ?: return
+                val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
+                val pkg = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME) ?: "unknown"
+                Log.d(TAG, "Audio session broadcast: action=$action, sessionId=$sessionId, pkg=$pkg")
+
+                if (action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION) {
+                    val currentLevel = getBoostLevelFromPrefs()
+                    if (currentLevel > 0) {
+                        Log.d(TAG, "New audio session detected while boost is active. Recreating enhancer.")
+                        createOrRecreateLoudnessEnhancer()
+                    }
+                }
+            }
+        }
+
+        val filter = IntentFilter().apply {
+            addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+            addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.registerReceiver(this, audioSessionReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(audioSessionReceiver, filter)
+        }
+        Log.d(TAG, "AudioSessionReceiver registered.")
+    }
+
+    /**
+     * Unregisters the audio session BroadcastReceiver.
+     */
+    private fun unregisterAudioSessionReceiver() {
+        audioSessionReceiver?.let {
+            try {
+                unregisterReceiver(it)
+                Log.d(TAG, "AudioSessionReceiver unregistered.")
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not unregister AudioSessionReceiver", e)
+            }
+        }
+        audioSessionReceiver = null
+    }
+
+    /**
+     * Starts a periodic health check that verifies the LoudnessEnhancer is still
+     * functioning correctly. If the enhancer has become stale (disabled unexpectedly
+     * or gain reset), it will be recreated. Only runs while boost level > 0.
+     */
+    private fun startHealthCheck() {
+        stopHealthCheck()
+        healthCheckRunnable = object : Runnable {
+            override fun run() {
+                val currentLevel = getBoostLevelFromPrefs()
+                if (currentLevel > 0) {
+                    val enhancer = loudnessEnhancer
+                    var needsRecreation = false
+
+                    if (enhancer == null) {
+                        Log.w(TAG, "Health check: enhancer is null while boost is active.")
+                        needsRecreation = true
+                    } else {
+                        try {
+                            if (!enhancer.enabled) {
+                                Log.w(TAG, "Health check: enhancer is disabled unexpectedly.")
+                                needsRecreation = true
+                            }
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Health check: enhancer threw exception (likely dead)", e)
+                            needsRecreation = true
+                        }
+                    }
+
+                    if (needsRecreation) {
+                        Log.d(TAG, "Health check: recreating LoudnessEnhancer.")
+                        createOrRecreateLoudnessEnhancer()
+                    }
+                }
+                healthCheckHandler.postDelayed(this, HEALTH_CHECK_INTERVAL_MS)
+            }
+        }
+        healthCheckHandler.postDelayed(healthCheckRunnable!!, HEALTH_CHECK_INTERVAL_MS)
+        Log.d(TAG, "Health check started (interval: ${HEALTH_CHECK_INTERVAL_MS}ms).")
+    }
+
+    /**
+     * Stops the periodic health check.
+     */
+    private fun stopHealthCheck() {
+        healthCheckRunnable?.let {
+            healthCheckHandler.removeCallbacks(it)
+        }
+        healthCheckRunnable = null
     }
 
     // Get current boost level from SharedPreferences
@@ -84,22 +202,20 @@ class BoosterService : Service() {
     override fun onCreate() {
         super.onCreate()
         sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        // audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager // AudioManager removed
         createNotificationChannel()
-        // LoudnessEnhancer's lazy initialization will read the level here
+        createOrRecreateLoudnessEnhancer()
+        registerAudioSessionReceiver()
+        startHealthCheck()
         Log.d(TAG, "Service onCreate. Initial level from Prefs: ${getBoostLevelFromPrefs()} mB")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "Service onStartCommand, Action: ${intent?.action}")
 
-        // Ensure enhancer is initialized when service starts (triggers lazy init)
-        loudnessEnhancer?.let { enhancer ->
-            Log.d(TAG, "Enhancer instance check in onStartCommand.")
-        } ?: run {
-            Log.e(TAG, "Enhancer instance is null in onStartCommand!")
-            // In case of error, we can stop the service or try restarting it.
-            // For now, let's just log it.
+        // Ensure enhancer exists; recreate if it was lost
+        if (loudnessEnhancer == null) {
+            Log.w(TAG, "Enhancer is null in onStartCommand, recreating.")
+            createOrRecreateLoudnessEnhancer()
         }
 
         // --- Start Foreground Immediately ---
@@ -360,10 +476,15 @@ class BoosterService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(TAG, "Service onDestroy")
+        // Stop health check
+        stopHealthCheck()
+        // Unregister audio session receiver
+        unregisterAudioSessionReceiver()
         try {
             // Disable and release enhancer when service stops
             loudnessEnhancer?.enabled = false
             loudnessEnhancer?.release()
+            loudnessEnhancer = null
             Log.d(TAG, "LoudnessEnhancer released from Service.")
         } catch (e: Exception) {
             Log.e(TAG, "Error releasing LoudnessEnhancer from Service", e)

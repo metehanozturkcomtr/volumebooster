@@ -68,9 +68,19 @@ class BoosterTileService : TileService() {
     override fun onClick() {
         super.onClick()
         Log.d(TAG, "onClick")
-        // Send toggle command to BoosterService
+        
+        val currentLevel = sharedPreferences.getInt(PREF_KEY_BOOST_LEVEL, 0)
+        val isEnabled = currentLevel > 0
+
+        val actionToSend = if (isEnabled) {
+            BoosterService.ACTION_EXIT_APP // Completely close the app instead of just disabling boost
+        } else {
+            BoosterService.ACTION_TOGGLE_BOOST // Turn on the boost
+        }
+
+        // Send command to BoosterService
         val intent = Intent(this, BoosterService::class.java).apply {
-            action = BoosterService.ACTION_TOGGLE_BOOST
+            action = actionToSend
         }
         // Start the service (if already running, only onStartCommand is triggered)
         // Since TileService is a Context, we can call startService directly.
