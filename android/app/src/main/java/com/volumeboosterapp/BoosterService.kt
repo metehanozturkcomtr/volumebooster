@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.media.audiofx.AudioEffect
+import android.media.audiofx.DynamicsProcessing
 import android.media.audiofx.LoudnessEnhancer
 import android.os.Build
 import android.os.Handler
@@ -27,10 +28,17 @@ class BoosterService : Service() {
 
     private lateinit var sharedPreferences: SharedPreferences
 
-    private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var activeEffect: AudioEffect? = null
+    private var isUsingDynamicsProcessing = false
     private var audioSessionReceiver: BroadcastReceiver? = null
     private val healthCheckHandler = Handler(Looper.getMainLooper())
     private var healthCheckRunnable: Runnable? = null
+    
+    private var silentAudioThread: Thread? = null
+    @Volatile private var isSilentAudioPlaying = false
+    private var silentAudioTrack: android.media.AudioTrack? = null
+    
+    private val initRunnable = Runnable { createLoudnessEnhancerOnce() }
 
     companion object {
         private const val TAG = "BoosterService"
@@ -57,49 +65,81 @@ class BoosterService : Service() {
      * (e.g. track change, playback restart) to work around Android 12+ custom ROM behavior
      * where effects attached to session 0 become stale.
      */
-    private fun createOrRecreateLoudnessEnhancer() {
+    private fun createLoudnessEnhancerOnce() {
+        if (activeEffect != null) return // Already created
+
         try {
-            // Release old instance if it exists
-            loudnessEnhancer?.let { old ->
+            val level = getBoostLevelFromPrefs()
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                // Use DynamicsProcessing on API 28+
+                // It is a modern audio engine that doesn't suffer from the Session 0 parity bugs of LoudnessEnhancer
                 try {
-                    old.enabled = false
-                    old.release()
-                    Log.d(TAG, "Old LoudnessEnhancer released before recreation.")
+                    val builder = DynamicsProcessing.Config.Builder(
+                        DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                        2, false, 0, false, 0, false, 0, true
+                    )
+                    val limiter = DynamicsProcessing.Limiter(
+                        true, true, 0, 10f, 50f, 1.0f, 0f, 0f // postGain set in applyBoostLevel
+                    )
+                    builder.setLimiterByChannelIndex(0, limiter)
+                    builder.setLimiterByChannelIndex(1, limiter)
+                    
+                    val dp = DynamicsProcessing(0, 0, builder.build())
+                    isUsingDynamicsProcessing = true
+                    activeEffect = dp
+                    applyBoostLevel(dp, level)
+                    Log.d(TAG, "DynamicsProcessing created successfully.")
+                    return
                 } catch (e: Exception) {
-                    Log.w(TAG, "Error releasing old LoudnessEnhancer", e)
+                    Log.w(TAG, "DynamicsProcessing failed, falling back to LoudnessEnhancer", e)
                 }
             }
-            loudnessEnhancer = null
 
-            val level = getBoostLevelFromPrefs()
-            val newEnhancer = LoudnessEnhancer(0) // Session ID 0 (global output mix)
+            // Fallback to LoudnessEnhancer
+            isUsingDynamicsProcessing = false
+            var newEnhancer: LoudnessEnhancer? = null
+            
+            for (i in 1..10) {
+                try {
+                    val candidate = LoudnessEnhancer(0)
+                    candidate.setTargetGain(1) 
+                    newEnhancer = candidate
+                    Log.d(TAG, "Successfully created valid LoudnessEnhancer on attempt $i")
+                    break 
+                } catch (e: Exception) {
+                    Log.w(TAG, "LoudnessEnhancer dead on attempt $i, retrying...")
+                }
+            }
+
+            if (newEnhancer == null) {
+                Log.e(TAG, "Failed to create a valid LoudnessEnhancer after 10 attempts!")
+                return
+            }
+            
             applyBoostLevel(newEnhancer, level)
-            loudnessEnhancer = newEnhancer
-            Log.d(TAG, "LoudnessEnhancer (re)created. Level: $level mB")
+            activeEffect = newEnhancer
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to create LoudnessEnhancer", e)
-            loudnessEnhancer = null
+            Log.e(TAG, "Fatal error in createLoudnessEnhancerOnce", e)
+            activeEffect = null
         }
     }
 
     /**
      * Registers a BroadcastReceiver that listens for new audio sessions being opened.
      * When a media app opens a new audio session (track change, new playback, etc.),
-     * we recreate the LoudnessEnhancer to ensure the boost effect is re-applied.
+     * we ensure the boost effect is re-applied.
      */
     private fun registerAudioSessionReceiver() {
         audioSessionReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 val action = intent?.action ?: return
-                val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
-                val pkg = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME) ?: "unknown"
-                Log.d(TAG, "Audio session broadcast: action=$action, sessionId=$sessionId, pkg=$pkg")
-
+                
                 if (action == AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION) {
                     val currentLevel = getBoostLevelFromPrefs()
                     if (currentLevel > 0) {
-                        Log.d(TAG, "New audio session detected while boost is active. Recreating enhancer.")
-                        createOrRecreateLoudnessEnhancer()
+                        Log.d(TAG, "New audio session detected while boost is active. Re-applying boost.")
+                        activeEffect?.let { applyBoostLevel(it, currentLevel) }
                     }
                 }
             }
@@ -136,42 +176,46 @@ class BoosterService : Service() {
     /**
      * Starts a periodic health check that verifies the LoudnessEnhancer is still
      * functioning correctly. If the enhancer has become stale (disabled unexpectedly
-     * or gain reset), it will be recreated. Only runs while boost level > 0.
+     * or gain reset), it will be re-applied or recreated. Only runs while boost level > 0.
      */
     private fun startHealthCheck() {
         stopHealthCheck()
         healthCheckRunnable = object : Runnable {
             override fun run() {
-                val currentLevel = getBoostLevelFromPrefs()
-                if (currentLevel > 0) {
-                    val enhancer = loudnessEnhancer
+                val expectedLevel = getBoostLevelFromPrefs()
+                if (expectedLevel > 0) {
                     var needsRecreation = false
+                    val effect = activeEffect
 
-                    if (enhancer == null) {
-                        Log.w(TAG, "Health check: enhancer is null while boost is active.")
+                    if (effect == null) {
                         needsRecreation = true
                     } else {
+                        var isDeadObject = false
                         try {
-                            if (!enhancer.enabled) {
-                                Log.w(TAG, "Health check: enhancer is disabled unexpectedly.")
+                            if (!effect.enabled) {
                                 needsRecreation = true
                             }
                         } catch (e: Exception) {
-                            Log.w(TAG, "Health check: enhancer threw exception (likely dead)", e)
-                            needsRecreation = true
+                            isDeadObject = true
+                        }
+
+                        if (isDeadObject) {
+                            activeEffect = null
+                            createLoudnessEnhancerOnce()
+                        } else if (needsRecreation) {
+                            applyBoostLevel(effect, expectedLevel)
                         }
                     }
 
-                    if (needsRecreation) {
-                        Log.d(TAG, "Health check: recreating LoudnessEnhancer.")
-                        createOrRecreateLoudnessEnhancer()
+                    if (needsRecreation && activeEffect != null) {
+                        applyBoostLevel(activeEffect!!, expectedLevel)
                     }
                 }
                 healthCheckHandler.postDelayed(this, HEALTH_CHECK_INTERVAL_MS)
             }
         }
         healthCheckHandler.postDelayed(healthCheckRunnable!!, HEALTH_CHECK_INTERVAL_MS)
-        Log.d(TAG, "Health check started (interval: ${HEALTH_CHECK_INTERVAL_MS}ms).")
+        Log.d(TAG, "Health check started.")
     }
 
     /**
@@ -203,7 +247,8 @@ class BoosterService : Service() {
         super.onCreate()
         sharedPreferences = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         createNotificationChannel()
-        createOrRecreateLoudnessEnhancer()
+        startSilentPlayback()
+        healthCheckHandler.postDelayed(initRunnable, 300)
         registerAudioSessionReceiver()
         startHealthCheck()
         Log.d(TAG, "Service onCreate. Initial level from Prefs: ${getBoostLevelFromPrefs()} mB")
@@ -213,9 +258,9 @@ class BoosterService : Service() {
         Log.d(TAG, "Service onStartCommand, Action: ${intent?.action}")
 
         // Ensure enhancer exists; recreate if it was lost
-        if (loudnessEnhancer == null) {
+        if (activeEffect == null) {
             Log.w(TAG, "Enhancer is null in onStartCommand, recreating.")
-            createOrRecreateLoudnessEnhancer()
+            createLoudnessEnhancerOnce()
         }
 
         // --- Start Foreground Immediately ---
@@ -319,35 +364,42 @@ class BoosterService : Service() {
         return START_STICKY
     }
 
-    // Applies the specified level to LoudnessEnhancer
-    private fun applyBoostLevel(enhancer: LoudnessEnhancer, level: Int) {
+    private fun applyBoostLevel(effect: AudioEffect, level: Int) {
         try {
-            if (level > 0) {
+            if (isUsingDynamicsProcessing && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val dp = effect as DynamicsProcessing
+                // Multiply the perceived loudness significantly (up to 25 dB)
+                val postGainDb = level / 400f 
+                val limiter = DynamicsProcessing.Limiter(
+                    true, true, 0, 10f, 50f, 1.0f, 0f, postGainDb
+                )
+                val config = DynamicsProcessing.Config.Builder(
+                    DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                    2, false, 0, false, 0, false, 0, true
+                ).build()
+                config.setLimiterByChannelIndex(0, limiter)
+                config.setLimiterByChannelIndex(1, limiter)
+                dp.setLimiterAllChannelsTo(limiter)
+                dp.enabled = true
+                Log.d(TAG, "DynamicsProcessing gain set: $postGainDb dB. (Always enabled)")
+            } else {
+                val enhancer = effect as LoudnessEnhancer
                 enhancer.setTargetGain(level)
                 enhancer.enabled = true
-                Log.d(TAG, "LoudnessEnhancer gain set: $level mB")
-            } else {
-                enhancer.enabled = false
-                Log.d(TAG, "LoudnessEnhancer disabled.")
+                Log.d(TAG, "LoudnessEnhancer gain set: $level mB. (Always enabled)")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to apply LoudnessEnhancer level ($level mB)", e)
+            Log.e(TAG, "Failed to apply effect level ($level mB)", e)
         }
     }
 
     // Sets boost level, saves to prefs, and applies to enhancer
     private fun setBoostLevel(level: Int) {
-        if (loudnessEnhancer == null) {
-            Log.e(TAG, "LoudnessEnhancer not available, cannot change level.")
-            return
+        if (level > 0) {
+            activeEffect?.let { applyBoostLevel(it, level) }
+        } else {
+            activeEffect?.let { applyBoostLevel(it, 0) }
         }
-        val enhancer = loudnessEnhancer // Assign value to local variable
-        if (enhancer == null) { // Check local variable (extra safety)
-             Log.e(TAG, "LoudnessEnhancer instance became null unexpectedly.")
-             return
-        }
-        // Apply level (LoudnessEnhancer)
-        applyBoostLevel(enhancer, level) // Use local variable
 
         // Code for adjusting call volume removed
         // applyVoiceCallVolume(level)
@@ -445,24 +497,20 @@ class BoosterService : Service() {
 
 
         // Set icon and text based on state
-        val iconResId = if (isBoostEnabled) R.drawable.ic_volume_up_white else R.drawable.ic_volume_off_white // Assuming custom icons
-        // Notification button: Shows the action to be performed (If active "Off" to turn off, if inactive "On" to turn on)
+        val iconResId = if (isBoostEnabled) R.drawable.ic_volume_up_white else R.drawable.ic_volume_off_white
         val buttonText = if (isBoostEnabled) "OFF" else "ON"
-        val contentText = if (isBoostEnabled) "Volume boost enabled" else "Volume boost disabled" // English content text
-
-        // Use default icons if custom ones are not available
-        // val iconResId = if (isBoostEnabled) android.R.drawable.ic_notification_overlay else android.R.drawable.stat_notify_call_mute
+        val contentText = if (isBoostEnabled) "Volume boost enabled" else "Volume boost disabled"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Volume Booster") // More generic title
+            .setContentTitle("Volume Booster")
             .setContentText(contentText)
-            .setSmallIcon(iconResId) // Icon based on state (should be in drawable folder)
-            .setContentIntent(pendingIntentActivity) // Open MainActivity on notification click
-            .addAction(0, buttonText, togglePendingIntent) // On/Off button
-            .addAction(0, "EXIT", exitPendingIntent) // Exit button
-            .setOngoing(true) // Cannot be easily dismissed by the user
-            .setPriority(NotificationCompat.PRIORITY_LOW) // Low priority
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC) // Show on lock screen
+            .setSmallIcon(iconResId)
+            .setContentIntent(pendingIntentActivity)
+            .addAction(0, buttonText, togglePendingIntent)
+            .addAction(0, "EXIT", exitPendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .build()
     }
 
@@ -478,16 +526,18 @@ class BoosterService : Service() {
         Log.d(TAG, "Service onDestroy")
         // Stop health check
         stopHealthCheck()
+        // Stop silent player
+        stopSilentPlayback()
         // Unregister audio session receiver
         unregisterAudioSessionReceiver()
         try {
             // Disable and release enhancer when service stops
-            loudnessEnhancer?.enabled = false
-            loudnessEnhancer?.release()
-            loudnessEnhancer = null
-            Log.d(TAG, "LoudnessEnhancer released from Service.")
+            activeEffect?.enabled = false
+            activeEffect?.release()
+            activeEffect = null
+            Log.d(TAG, "AudioEffect released from Service.")
         } catch (e: Exception) {
-            Log.e(TAG, "Error releasing LoudnessEnhancer from Service", e)
+            Log.e(TAG, "Error releasing AudioEffect from Service", e)
         }
         // Set saved level to 0 when service stops to ensure Tile updates
         sharedPreferences.edit().putInt(PREF_KEY_BOOST_LEVEL, 0).apply()
@@ -501,10 +551,72 @@ class BoosterService : Service() {
 
     // Called when the task the service is associated with is removed (e.g., swiped from recents)
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.d(TAG, "onTaskRemoved called. Stopping service.")
-        // Stop the service explicitly
-        stopForeground(true) // Remove notification
-        stopSelf() // Stop the service itself
+        Log.d(TAG, "onTaskRemoved called. Keeping service alive in background.")
+        // Intentionally NOT stopping the service to bypass Custom ROM AudioFlinger bugs 
+        // that trigger when the app process is killed and the session is torn down.
         super.onTaskRemoved(rootIntent)
+    }
+
+    private fun startSilentPlayback() {
+        if (isSilentAudioPlaying) return
+        isSilentAudioPlaying = true
+        silentAudioThread = Thread {
+            try {
+                val sampleRate = 44100
+                val minBufferSize = android.media.AudioTrack.getMinBufferSize(
+                    sampleRate,
+                    android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT
+                )
+                val bufferSize = if (minBufferSize > 0) minBufferSize else 4096
+
+                silentAudioTrack = android.media.AudioTrack.Builder()
+                    .setAudioAttributes(
+                        android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        android.media.AudioFormat.Builder()
+                            .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufferSize)
+                    .setTransferMode(android.media.AudioTrack.MODE_STREAM)
+                    .build()
+                
+                silentAudioTrack?.setVolume(0f)
+                silentAudioTrack?.play()
+                
+                val silentData = ByteArray(bufferSize)
+                while (isSilentAudioPlaying) {
+                    silentAudioTrack?.write(silentData, 0, silentData.size)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Silent AudioTrack error", e)
+            } finally {
+                try {
+                    silentAudioTrack?.stop()
+                    silentAudioTrack?.release()
+                } catch (e: Exception) {}
+                silentAudioTrack = null
+            }
+        }
+        silentAudioThread?.start()
+        Log.d(TAG, "Continuous gapless silent AudioTrack started.")
+    }
+
+    private fun stopSilentPlayback() {
+        if (!isSilentAudioPlaying) return
+        isSilentAudioPlaying = false
+        silentAudioThread?.interrupt()
+        try {
+            silentAudioThread?.join(500) // Wait up to 500ms for thread to die and release AudioTrack
+        } catch (e: Exception) {}
+        silentAudioThread = null
+        Log.d(TAG, "Continuous gapless silent AudioTrack stopped.")
     }
 }
